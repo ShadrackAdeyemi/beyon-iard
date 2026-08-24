@@ -1,0 +1,140 @@
+{
+  "name": "IARD - Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "New Audit Engagement Intake",
+        "formDescription": "Start a new audit report draft. Working file and kick-off deck are mandatory; the rest are optional but should be attached if available.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "Audit Title", "requiredField": true },
+            { "fieldLabel": "Quarter", "requiredField": true },
+            { "fieldLabel": "Year", "requiredField": true },
+            { "fieldLabel": "Entity", "fieldType": "dropdown", "requiredField": true,
+              "fieldOptions": { "values": [
+                { "option": "Batelco" }, { "option": "Beyon Solutions" }, { "option": "Beyon Cyber" },
+                { "option": "Beyon (Group)" }
+              ] } },
+            { "fieldLabel": "Overall Opinion", "fieldType": "dropdown", "requiredField": true,
+              "fieldOptions": { "values": [
+                { "option": "Satisfactory" }, { "option": "Minor Improvement Required" },
+                { "option": "Improvement Required" }, { "option": "Inadequate / Unsatisfactory" },
+                { "option": "Not Rated" }
+              ] } },
+            { "fieldLabel": "Completed Audit Working File", "fieldType": "file", "requiredField": true },
+            { "fieldLabel": "Kick-off Deck", "fieldType": "file", "requiredField": true },
+            { "fieldLabel": "Process Understanding (optional)", "fieldType": "file", "requiredField": false },
+            { "fieldLabel": "Audit Notification (optional)", "fieldType": "file", "requiredField": false },
+            { "fieldLabel": "Analysis Sheet (optional)", "fieldType": "file", "requiredField": false },
+            { "fieldLabel": "Supporting Evidence (optional, multiple)", "fieldType": "file", "requiredField": false }
+          ]
+        }
+      },
+      "id": "form-trigger",
+      "name": "Form Trigger: New Engagement",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2,
+      "position": [-400, -200]
+    },
+    {
+      "parameters": {
+        "mode": "webhook",
+        "options": { "loadPreviousSession": "memory" }
+      },
+      "id": "chat-trigger",
+      "name": "Chat Trigger: Refinement Message",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [-400, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "engagement",
+        "columns": "title,quarter,year,entity,overall_opinion_label",
+        "additionalFields": {}
+      },
+      "id": "create-engagement",
+      "name": "Postgres: Create Engagement",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-100, -200],
+      "notes": "Also generates chat_session_id (uuid) and stores it against the row so the Chat Trigger below can resolve future messages to this engagement."
+    },
+    {
+      "parameters": {
+        "workflowId": "intake-and-parse"
+      },
+      "id": "call-intake",
+      "name": "Execute Sub-workflow: Intake & Parse",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [150, -200]
+    },
+    {
+      "parameters": {
+        "workflowId": "front-matter-assembly"
+      },
+      "id": "call-frontmatter",
+      "name": "Execute Sub-workflow: Front-Matter Assembly",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [400, -200]
+    },
+    {
+      "parameters": {
+        "workflowId": "observation-drafting"
+      },
+      "id": "call-drafting",
+      "name": "Execute Sub-workflow: Observation Drafting",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [650, -200]
+    },
+    {
+      "parameters": {
+        "workflowId": "document-assembly"
+      },
+      "id": "call-assembly-1",
+      "name": "Execute Sub-workflow: Document Assembly (first draft)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [900, -200]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": "public",
+        "table": "engagement",
+        "where": { "values": [{ "column": "chat_session_id", "value": "={{ $json.sessionId }}" }] }
+      },
+      "id": "resolve-engagement",
+      "name": "Postgres: Resolve Engagement by Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-100, 200],
+      "notes": "No new-engagement path here by design. If no row matches, respond with an error — chat only ever continues an existing engagement, per BRD FR-22 / NFR-04."
+    },
+    {
+      "parameters": {
+        "workflowId": "refinement"
+      },
+      "id": "call-refinement",
+      "name": "Execute Sub-workflow: Refinement",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [150, 200]
+    }
+  ],
+  "connections": {
+    "Form Trigger: New Engagement": { "main": [[{ "node": "Postgres: Create Engagement", "type": "main", "index": 0 }]] },
+    "Postgres: Create Engagement": { "main": [[{ "node": "Execute Sub-workflow: Intake & Parse", "type": "main", "index": 0 }]] },
+    "Execute Sub-workflow: Intake & Parse": { "main": [[{ "node": "Execute Sub-workflow: Front-Matter Assembly", "type": "main", "index": 0 }]] },
+    "Execute Sub-workflow: Front-Matter Assembly": { "main": [[{ "node": "Execute Sub-workflow: Observation Drafting", "type": "main", "index": 0 }]] },
+    "Execute Sub-workflow: Observation Drafting": { "main": [[{ "node": "Execute Sub-workflow: Document Assembly (first draft)", "type": "main", "index": 0 }]] },
+    "Chat Trigger: Refinement Message": { "main": [[{ "node": "Postgres: Resolve Engagement by Session", "type": "main", "index": 0 }]] },
+    "Postgres: Resolve Engagement by Session": { "main": [[{ "node": "Execute Sub-workflow: Refinement", "type": "main", "index": 0 }]] }
+  },
+  "_notes": "Orchestrator is intentionally thin: it identifies the engagement and dispatches to sub-workflows. No drafting or editing logic lives here."
+}

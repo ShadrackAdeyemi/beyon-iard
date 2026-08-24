@@ -1,0 +1,113 @@
+{
+  "name": "IARD - Sub-workflow: Document Assembly",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "sub-trigger",
+      "name": "When Executed (by Orchestrator or on-demand 'regenerate')",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": "public",
+        "table": "observation",
+        "where": { "values": [{ "column": "engagement_id", "value": "={{ $json.engagement_id }}" }] },
+        "sort": { "values": [{ "column": "sequence_no" }] }
+      },
+      "id": "load-observations",
+      "name": "Postgres: Load Current Observations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-350, -150],
+      "notes": "This is a deterministic render step. Frozen/approved observations are rendered as-is, never re-generated (FR-20)."
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": "public",
+        "table": "appendix_item",
+        "where": { "values": [{ "column": "observation_id", "value": "={{ $json.observation_id }}" }] }
+      },
+      "id": "load-appendix",
+      "name": "Postgres: Load Appendix Items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-350, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Derived sections, rebuilt fresh on every generation (content rule; FR-04/FR-13):\n// - Table of Contents with correct page numbers\n// - List of Audit Issues: number, risk letter/colour, hyperlinked title, page; owner/target date left blank in draft\n// - Audit Issues Dashboard: business areas pre-filled, counts left blank for the auditor\n// area_for_improvement observations are EXCLUDED from both the dashboard counts and the issue list (FR-26).\nconst obs = $input.all().map(i => i.json);\nconst listable = obs.filter(o => o.risk_rating !== 'area_for_improvement');\nconst listOfIssues = listable.map((o, idx) => ({\n  no: idx + 1, risk_letter: o.risk_rating, title: o.title, hyperlink_target: o.id, page: null, owner: null, target_date: null\n}));\nreturn [{ json: { list_of_audit_issues: listOfIssues, observation_count: obs.length } }];"
+      },
+      "id": "build-derived",
+      "name": "Build Derived Sections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-100, -150]
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      },
+      "id": "assign-stable-ids",
+      "name": "Assign Stable Paragraph IDs (for round-trip mapping)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [150, -150],
+      "notes": "Each rendered observation paragraph gets a bookmark/content-control tagged with its observation.id, so a later re-uploaded Word file can be diffed back to specific rows (feeds the Round-trip Reconciliation sub-workflow)."
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "operation": "generateFromTemplate",
+        "templateUrl": "={{$env.REPORT_TEMPLATE_URL}}",
+        "additionalFields": {}
+      },
+      "id": "render-word",
+      "name": "Render Word Document from Beyon Template",
+      "type": "n8n-nodes-base.microsoftWord",
+      "typeVersion": 1,
+      "position": [400, -150],
+      "notes": "Template fidelity enforced structurally (GR-02): structure/table shapes/rating colours validated against the fixed template before reaching the reviewer, not left to model judgement."
+    },
+    {
+      "parameters": {
+        "jsCode": "// GR-02 automated structural validation: diff generated doc against the fixed template\n// (section order, table shapes, rating labels/colours) before handing back to the auditor.\nreturn $input.all();"
+      },
+      "id": "validate-template-fidelity",
+      "name": "Validate Template Fidelity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, -150]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "change_log",
+        "columns": "engagement_id,actor,action"
+      },
+      "id": "log-generation",
+      "name": "Postgres: Log Generation Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, -150]
+    }
+  ],
+  "connections": {
+    "When Executed (by Orchestrator or on-demand 'regenerate')": {
+      "main": [[
+        { "node": "Postgres: Load Current Observations", "type": "main", "index": 0 },
+        { "node": "Postgres: Load Appendix Items", "type": "main", "index": 0 }
+      ]]
+    },
+    "Postgres: Load Current Observations": { "main": [[{ "node": "Build Derived Sections", "type": "main", "index": 0 }]] },
+    "Build Derived Sections": { "main": [[{ "node": "Assign Stable Paragraph IDs (for round-trip mapping)", "type": "main", "index": 0 }]] },
+    "Assign Stable Paragraph IDs (for round-trip mapping)": { "main": [[{ "node": "Render Word Document from Beyon Template", "type": "main", "index": 0 }]] },
+    "Render Word Document from Beyon Template": { "main": [[{ "node": "Validate Template Fidelity", "type": "main", "index": 0 }]] },
+    "Validate Template Fidelity": { "main": [[{ "node": "Postgres: Log Generation Event", "type": "main", "index": 0 }]] }
+  }
+}

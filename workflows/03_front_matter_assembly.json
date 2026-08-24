@@ -1,0 +1,98 @@
+{
+  "name": "IARD - Sub-workflow: Front-Matter Assembly",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "sub-trigger",
+      "name": "When Executed by Orchestrator",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verbatim sections: copied byte-for-byte from source, never paraphrased or restyled (content rule 7).\n// These come from the fixed report template + parsed kick-off deck fields.\nconst e = $('When Executed by Orchestrator').first().json;\nreturn [{ json: {\n  cover_page: { title: e.title, quarter: e.quarter, year: e.year, entity: e.entity, status: 'Draft Report' },\n  objectives: e.kickoff_objectives,          // verbatim bullets from kickoff deck\n  scope: { review_period: e.kickoff_review_period, items: e.kickoff_scope_items, limitations: e.kickoff_scope_limitations || null },\n  limitations_of_internal_audit: 'STANDARD_TEMPLATE_TEXT', // reproduced unchanged from Beyon's template\n  risk_classification: 'STANDARD_TEMPLATE_TEXT'             // four-grade scale, reproduced unchanged\n}}];"
+      },
+      "id": "assemble-verbatim",
+      "name": "Assemble Verbatim Sections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-350, -150]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fill sections: fixed sentence structure, names/areas substituted from kickoff deck (content rule per FR-09/FR-10).\nconst e = $('When Executed by Orchestrator').first().json;\nreturn [{ json: {\n  acknowledgment: `We wish to place on record our appreciation for the co-operation and assistance rendered to us by ${e.acknowledged_department} teams.`,\n  audit_team: e.audit_team // {auditor, audit_manager, chief_of_internal_audit} mapped from kickoff deck's closing slide (D-3)\n}}];"
+      },
+      "id": "assemble-fill",
+      "name": "Assemble Fill Sections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-350, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.STATE_API_URL}}/opinion-library-lookup",
+        "sendBody": true,
+        "bodyParameters": { "parameters": [{ "name": "label", "value": "={{ $('When Executed by Orchestrator').first().json.overall_opinion_label }}" }] }
+      },
+      "id": "lookup-opinion",
+      "name": "Lookup Overall Opinion Paragraph",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-350, 150],
+      "notes": "Source: overall_opinion_library.json (provisional, pending Beyon D-2 sign-off). 'Not Rated' -> no paragraph inserted, per scoping call confirmation."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Background is GENERATED, not verbatim (content rule + FR-05) — the one section here that involves\n// LLM judgement, constrained to the notification, process understanding and working-file context,\n// plus the analysis sheet if supplied (min. one introductory paragraph if not).\nconst hasAnalysisSheet = $('When Executed by Orchestrator').first().json.input_gaps?.includes('analysis_sheet') === false;\nreturn [{ json: { background_llm_prompt_ready: true, include_analysis_placement: hasAnalysisSheet } }];"
+      },
+      "id": "prep-background",
+      "name": "Prepare Background Generation Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-100, -300]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Draft a one-page background/introduction for this internal audit report, consistent with the audit notification, process understanding, and completed audit working file provided below. Do not state anything not supported by these sources. If an analysis sheet is provided, reference it is placed and captioned separately — do not fabricate figures.\n\n{{ $json }}"
+      },
+      "id": "generate-background",
+      "name": "LLM: Draft Background Section",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [150, -300],
+      "notes": "GR-03/GR-04: grounded generation only. No invented figures or conclusions."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "engagement",
+        "updateKey": "id",
+        "columns": "audit_team"
+      },
+      "id": "persist-frontmatter",
+      "name": "Postgres: Persist Front-Matter to Engagement",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [400, 0],
+      "notes": "Verbatim/fill/opinion/background fields merged and written back onto the engagement row (or a front_matter table if preferred over JSONB on engagement — left as an implementation choice)."
+    }
+  ],
+  "connections": {
+    "When Executed by Orchestrator": {
+      "main": [[
+        { "node": "Assemble Verbatim Sections", "type": "main", "index": 0 },
+        { "node": "Assemble Fill Sections", "type": "main", "index": 0 },
+        { "node": "Lookup Overall Opinion Paragraph", "type": "main", "index": 0 },
+        { "node": "Prepare Background Generation Inputs", "type": "main", "index": 0 }
+      ]]
+    },
+    "Prepare Background Generation Inputs": { "main": [[{ "node": "LLM: Draft Background Section", "type": "main", "index": 0 }]] },
+    "Assemble Verbatim Sections": { "main": [[{ "node": "Postgres: Persist Front-Matter to Engagement", "type": "main", "index": 0 }]] },
+    "Assemble Fill Sections": { "main": [[{ "node": "Postgres: Persist Front-Matter to Engagement", "type": "main", "index": 0 }]] },
+    "Lookup Overall Opinion Paragraph": { "main": [[{ "node": "Postgres: Persist Front-Matter to Engagement", "type": "main", "index": 0 }]] },
+    "LLM: Draft Background Section": { "main": [[{ "node": "Postgres: Persist Front-Matter to Engagement", "type": "main", "index": 0 }]] }
+  }
+}

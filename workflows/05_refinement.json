@@ -1,0 +1,232 @@
+{
+  "name": "IARD - Sub-workflow: Refinement (Detailed Audit Issues only)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "sub-trigger",
+      "name": "When Executed by Orchestrator",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-700, 0]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Classify this audit-report editing instruction into exactly one of: merge, split, reword, re-rate, attach_evidence, move_to_appendix, approve, query_status, other. Also extract which observation number(s) it refers to.\n\nMessage: {{ $json.chatInput }}",
+        "hasOutputParser": true
+      },
+      "id": "classify-instruction",
+      "name": "LLM: Classify Instruction",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [-450, 0],
+      "notes": "Scoped strictly to Section 7 (Detailed Audit Issues) per your instruction — this sub-workflow does not accept edits to background, front matter, or appendices outside an observation's own appendix items."
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": "public",
+        "table": "observation",
+        "where": { "values": [{ "column": "id", "value": "={{ $json.observation_ids }}" }] }
+      },
+      "id": "load-target-observations",
+      "name": "Postgres: Load Only Referenced Observation(s)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-200, 0],
+      "notes": "Deliberately narrow context — only the affected rows, not the whole report. This is what keeps FR-19 'without regenerating from scratch' true and keeps prompt cost/drift down."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "leftValue": "={{ $json.approval_status }}", "rightValue": "frozen", "operator": { "type": "string", "operation": "equals" } }]
+        }
+      },
+      "id": "check-frozen",
+      "name": "IF: Observation Already Frozen?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [50, 0]
+    },
+    {
+      "parameters": {
+        "text": "This observation is already approved and frozen (GR-01) and cannot be edited. Start a new instruction if you'd like to unfreeze it — not supported in this pilot."
+      },
+      "id": "reject-frozen-edit",
+      "name": "Respond: Cannot Edit Frozen Observation",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [300, 100]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "merge" }] }, "outputKey": "merge" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "split" }] }, "outputKey": "split" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "reword" }] }, "outputKey": "reword" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "re-rate" }] }, "outputKey": "re_rate" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "attach_evidence" }] }, "outputKey": "attach_evidence" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "move_to_appendix" }] }, "outputKey": "move_to_appendix" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "approve" }] }, "outputKey": "approve" },
+            { "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "query_status" }] }, "outputKey": "query_status" }
+          ]
+        }
+      },
+      "id": "route-by-action",
+      "name": "Switch: Route by Instruction Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [300, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge two+ observations into one. Combines criteria/condition/cause/risk/recommendation via LLM\n// with the merged sources still tracked in source_refs; original sequence_nos retired.\nreturn $input.all();"
+      },
+      "id": "action-merge",
+      "name": "Apply: Merge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, -400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split one observation into two+ new rows, each inheriting a subset of source_refs.\nreturn $input.all();"
+      },
+      "id": "action-split",
+      "name": "Apply: Split",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, -300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reword content per instruction. Still grounded to existing source_refs — GR-03 applies to edits too, not just first drafts.\nreturn $input.all();"
+      },
+      "id": "action-reword",
+      "name": "Apply: Reword",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, -200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update risk_rating; observation table colour/label follow automatically at render time.\nreturn $input.all();"
+      },
+      "id": "action-rerate",
+      "name": "Apply: Re-rate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, -100]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "appendix_item",
+        "columns": "observation_id,appendix_number,content_ref,direction,created_by"
+      },
+      "id": "action-attach-evidence",
+      "name": "Apply: Attach Evidence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [550, 0]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "appendix_item",
+        "columns": "observation_id,appendix_number,content_ref,direction,created_by"
+      },
+      "id": "action-move-to-appendix",
+      "name": "Apply: Move to Appendix (manual direction)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [550, 100],
+      "notes": "direction='manual' distinguishes auditor-directed moves from the automatic length-heuristic ones (D-4 open item on the exact rule)."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "observation",
+        "updateKey": "id",
+        "columns": "approval_status,last_edited_by"
+      },
+      "id": "action-approve",
+      "name": "Apply: Approve (flip to frozen)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [550, 200],
+      "notes": "This is the GR-01 final gate. DB trigger prevent_frozen_overwrite then protects the row from any further mutation."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read-only: no mutation, just report current status back to the auditor.\nreturn $input.all();"
+      },
+      "id": "action-query-status",
+      "name": "Apply: Query Status (no-op)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "change_log",
+        "columns": "engagement_id,observation_id,actor,action,before_snapshot,after_snapshot"
+      },
+      "id": "write-change-log",
+      "name": "Postgres: Write Change Log Entry",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [850, 0],
+      "notes": "Satisfies FR-25/GR-05 as a by-product of every mutation, not a separate logging pass. actor='human' since it originated from an explicit auditor instruction."
+    },
+    {
+      "parameters": {
+        "text": "=Confirmed: {{ $json.action }} applied to observation(s) {{ $json.observation_ids }}. {{ $json.summary }}"
+      },
+      "id": "respond-confirmation",
+      "name": "Respond in Chat: Confirmation",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [1100, 0]
+    }
+  ],
+  "connections": {
+    "When Executed by Orchestrator": { "main": [[{ "node": "LLM: Classify Instruction", "type": "main", "index": 0 }]] },
+    "LLM: Classify Instruction": { "main": [[{ "node": "Postgres: Load Only Referenced Observation(s)", "type": "main", "index": 0 }]] },
+    "Postgres: Load Only Referenced Observation(s)": { "main": [[{ "node": "IF: Observation Already Frozen?", "type": "main", "index": 0 }]] },
+    "IF: Observation Already Frozen?": {
+      "main": [
+        [{ "node": "Respond: Cannot Edit Frozen Observation", "type": "main", "index": 0 }],
+        [{ "node": "Switch: Route by Instruction Type", "type": "main", "index": 0 }]
+      ]
+    },
+    "Switch: Route by Instruction Type": {
+      "main": [
+        [{ "node": "Apply: Merge", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Split", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Reword", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Re-rate", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Attach Evidence", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Move to Appendix (manual direction)", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Approve (flip to frozen)", "type": "main", "index": 0 }],
+        [{ "node": "Apply: Query Status (no-op)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apply: Merge": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Split": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Reword": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Re-rate": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Attach Evidence": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Move to Appendix (manual direction)": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Approve (flip to frozen)": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Apply: Query Status (no-op)": { "main": [[{ "node": "Postgres: Write Change Log Entry", "type": "main", "index": 0 }]] },
+    "Postgres: Write Change Log Entry": { "main": [[{ "node": "Respond in Chat: Confirmation", "type": "main", "index": 0 }]] }
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "name": "IARD - Sub-workflow: Intake & Parse",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "sub-trigger",
+      "name": "When Executed by Orchestrator",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify each uploaded file against the fixed input-type list from BRD section 6.\n// Mandatory: completed_audit_working_file, kickoff_deck.\n// Optional: process_understanding, audit_notification, analysis_sheet, supporting_evidence.\nconst files = $input.all();\nconst classified = files.map(f => ({\n  json: {\n    engagement_id: $('When Executed by Orchestrator').first().json.engagement_id,\n    doc_type: f.json.formFieldName, // mapped from the form's named upload slots\n    file_ref: f.binary?.data?.fileName || f.json.fileRef\n  }\n}));\nreturn classified;"
+      },
+      "id": "classify-inputs",
+      "name": "Classify Uploaded Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-350, 0]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "source_document",
+        "columns": "engagement_id,doc_type,file_ref"
+      },
+      "id": "insert-source-docs",
+      "name": "Postgres: Insert source_document rows",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-100, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gap flagging (FR-23): record which optional inputs are missing so the report\n// can surface this explicitly rather than silently proceeding.\nconst required = ['completed_audit_working_file', 'kickoff_deck'];\nconst optional = ['process_understanding', 'audit_notification', 'analysis_sheet'];\nconst present = new Set($input.all().map(i => i.json.doc_type));\nconst missingRequired = required.filter(t => !present.has(t));\nif (missingRequired.length) {\n  throw new Error('Missing mandatory input(s): ' + missingRequired.join(', '));\n}\nconst gaps = optional.filter(t => !present.has(t));\nreturn [{ json: { input_gaps: gaps } }];"
+      },
+      "id": "compute-gaps",
+      "name": "Compute Input Gaps",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [150, 0]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "engagement",
+        "updateKey": "id",
+        "columns": "input_gaps"
+      },
+      "id": "update-engagement-gaps",
+      "name": "Postgres: Record Gaps on Engagement",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [400, -150]
+    },
+    {
+      "parameters": {
+        "workflowId": "parse-working-file"
+      },
+      "id": "call-parse-working-file",
+      "name": "Execute: Parse Completed Audit Working File (xlsx)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [400, 0],
+      "notes": "Row-level extraction into working_file_row per the Archer-export schema (risk, control, test steps, work done, test status/result, residual risk level, evidence refs)."
+    },
+    {
+      "parameters": {
+        "workflowId": "parse-kickoff-deck"
+      },
+      "id": "call-parse-kickoff",
+      "name": "Execute: Parse Kick-off Deck (pptx)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [400, 150],
+      "notes": "Extracts objectives, scope, review period, stakeholder/acknowledgment text, and the 3 audit-team name+title pairs (D-3 alignment)."
+    },
+    {
+      "parameters": {
+        "workflowId": "parse-optional-inputs"
+      },
+      "id": "call-parse-optional",
+      "name": "Execute: Parse Optional Inputs (notification / process understanding incl. legacy .ppt / analysis sheet)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [400, 300],
+      "notes": "Only runs for inputs actually present. Legacy .ppt must be handled (FR-05). Any embedded image content is NOT auto-placed in the pilot — flagged as a known limitation pending scope decision."
+    }
+  ],
+  "connections": {
+    "When Executed by Orchestrator": { "main": [[{ "node": "Classify Uploaded Inputs", "type": "main", "index": 0 }]] },
+    "Classify Uploaded Inputs": { "main": [[{ "node": "Postgres: Insert source_document rows", "type": "main", "index": 0 }]] },
+    "Postgres: Insert source_document rows": { "main": [[{ "node": "Compute Input Gaps", "type": "main", "index": 0 }]] },
+    "Compute Input Gaps": {
+      "main": [[
+        { "node": "Postgres: Record Gaps on Engagement", "type": "main", "index": 0 },
+        { "node": "Execute: Parse Completed Audit Working File (xlsx)", "type": "main", "index": 0 },
+        { "node": "Execute: Parse Kick-off Deck (pptx)", "type": "main", "index": 0 },
+        { "node": "Execute: Parse Optional Inputs (notification / process understanding incl. legacy .ppt / analysis sheet)", "type": "main", "index": 0 }
+      ]]
+    }
+  }
+}
