@@ -25,14 +25,41 @@ inventing one (GR-04, content rule 8).
 
 ## Setup
 
-1. Place Beyon's actual (blank) report template at `report_template.docx`
-   next to `main.py` — **not** committed to any repo, since it's
+1. Place Beyon's actual (blank) report template at the path `TEMPLATE_PATH`
+   points to (default `/etc/secrets/report_template.docx`, overridable via
+   the `TEMPLATE_PATH` env var) — **not** committed to any repo, since it's
    Restricted-classified per BRD section 10. The copy this was tested
    against still has sample placeholder text baked into some sections; a
-   genuinely blank version will render cleaner.
+   genuinely blank version will render cleaner. For local dev, the simplest
+   option is `export TEMPLATE_PATH=./report_template.docx` and drop the file
+   next to `main.py`.
 2. `pip install -r requirements.txt`
 3. `uvicorn main:app --host 0.0.0.0 --port 8000` (or build/run the Dockerfile)
-4. Confirm `GET /health` returns `{"status": "ok"}`.
+4. Confirm `GET /health` returns `{"status": "ok", "template_found": true}`.
+   If `template_found` is `false`, the template hasn't landed at
+   `TEMPLATE_PATH` yet — `/render-report` will fail with
+   `"Package not found at '<path>'"` until it does.
+
+## Deploying on Render (never via git)
+
+The template is Restricted-classified and must never be committed, so it
+reaches the deployed service through Render itself, not through the build:
+
+1. Render dashboard → the `beyon-iard` service → **Environment** →
+   **Secret Files** → **Add Secret File**.
+2. Filename: `report_template.docx` (exact name — Render mounts it at
+   `/etc/secrets/report_template.docx`, which is `main.py`'s default
+   `TEMPLATE_PATH`).
+3. Upload Beyon's actual template file as the contents.
+4. Save — Render redeploys the service automatically. No `TEMPLATE_PATH`
+   env var is needed if the filename above is used exactly as given; only
+   set `TEMPLATE_PATH` explicitly if a persistent Disk is used instead of a
+   Secret File (e.g. `TEMPLATE_PATH=/var/data/report_template.docx`, with
+   the Disk mounted at `/var/data`).
+5. Verify with `GET /health` — `template_found` should read `true`.
+
+This keeps the Restricted file off GitHub entirely (public or private repo)
+while still getting it into the running container.
 
 ## Known simplifications (be aware before treating this as final)
 

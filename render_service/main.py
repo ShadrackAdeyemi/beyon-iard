@@ -20,6 +20,7 @@ Design constraints carried over from the BRD / HLD:
 """
 
 import io
+import os
 import copy
 from typing import Optional
 
@@ -30,7 +31,15 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-TEMPLATE_PATH = "report_template.docx"  # Beyon's fixed template, deployed alongside this service
+# Beyon's fixed template is Restricted-classified (BRD Section 10) and is never committed to git
+# (see Dockerfile). It's provided to the running container instead, and the location depends on
+# how it's mounted:
+#   - Render Secret File (recommended for the pilot): dashboard-uploaded files land at
+#     /etc/secrets/<filename>, NOT in the app's working directory — hence this default.
+#   - Render persistent Disk: set TEMPLATE_PATH to wherever the disk is mounted, e.g.
+#     /var/data/report_template.docx.
+# Either way, override via the TEMPLATE_PATH env var rather than editing this default in code.
+TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "/etc/secrets/report_template.docx")
 
 RATING_LABELS = {
     "active_management_very_high": "Active Management (Very High)",
@@ -310,4 +319,12 @@ def render_report_endpoint(req: RenderRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # Surfaces the template-availability problem directly, instead of only discovering it on the
+    # first real /render-report call (which is how we found it — Aug 28/31 failures both traced
+    # back to this). Still 200s so this doesn't flap the service's deploy health check; the
+    # template_found field is what to check.
+    return {
+        "status": "ok",
+        "template_path": TEMPLATE_PATH,
+        "template_found": os.path.isfile(TEMPLATE_PATH),
+    }
