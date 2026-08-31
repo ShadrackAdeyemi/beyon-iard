@@ -30,15 +30,14 @@ from pydantic import BaseModel
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.table import Table
 
 # Beyon's fixed template is Restricted-classified (BRD Section 10) and is never committed to git
-# (see Dockerfile). It's provided to the running container instead, and the location depends on
-# how it's mounted:
-#   - Render Secret File (recommended for the pilot): dashboard-uploaded files land at
-#     /etc/secrets/<filename>, NOT in the app's working directory — hence this default.
-#   - Render persistent Disk: set TEMPLATE_PATH to wherever the disk is mounted, e.g.
-#     /var/data/report_template.docx.
-# Either way, override via the TEMPLATE_PATH env var rather than editing this default in code.
+# (see Dockerfile). It's provided to the running container instead, via a Render Secret File named
+# report_template.docx — Render mounts Secret Files at /etc/secrets/<filename>, not into the app's
+# working directory, hence this default. Override via the TEMPLATE_PATH env var for local dev
+# (point it at a plain .docx next to main.py) or if a persistent Disk is used instead of a Secret
+# File (point it at the Disk's mount path, e.g. /var/data/report_template.docx).
 TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "/etc/secrets/report_template.docx")
 
 RATING_LABELS = {
@@ -167,6 +166,46 @@ def shade_cell(cell, hex_colour: str):
     tc_pr.append(shd)
 
 
+def find_rating_card_tables(doc: Document) -> dict:
+    """Locate the 5 per-rating "Detailed Audit Issues" card tables (one per RATING_LABELS value,
+    e.g. "Active Management (Very High)"), by matching each table's row-0 last cell against the
+    known rating labels — verified against the real template: row 0's first grid columns are a
+    merged empty banner cell, and the last cell holds the rating text. Returns {rating_key: Table}.
+    """
+    label_to_key = {v: k for k, v in RATING_LABELS.items()}
+    found = {}
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        last_cell_text = table.rows[0].cells[-1].text.strip()
+        rating_key = label_to_key.get(last_cell_text)
+        if rating_key and rating_key not in found:
+            found[rating_key] = table
+    return found
+
+
+def remove_table(table) -> None:
+    """Delete a card table entirely — used when a rating has zero observations, so the issued
+    report doesn't show an empty rating section that was only ever a template placeholder."""
+    table._tbl.getparent().remove(table._tbl)
+
+
+def set_cell_paragraphs(cell, lines: list) -> "Paragraph":
+    """Write a list of (text, bold) lines into a table cell as separate paragraphs, reusing the
+    cell's existing (usually empty) first paragraph for the first line rather than leaving a blank
+    line above the content. Returns the first paragraph, for bookmarking."""
+    first_para = cell.paragraphs[0]
+    first_para.text = ""
+    first_text, first_bold = lines[0] if lines else ("", False)
+    run = first_para.add_run(first_text)
+    run.bold = first_bold
+    for text, bold in lines[1:]:
+        p = cell.add_paragraph()
+        run = p.add_run(text)
+        run.bold = bold
+    return first_para
+
+
 def render_report(req: RenderRequest) -> bytes:
     doc = Document(TEMPLATE_PATH)
     fm = req.front_matter
@@ -241,6 +280,13 @@ def render_report(req: RenderRequest) -> bytes:
             list_table = table
 
     if list_table:
+        # The template ships with sample rows already filled in under the header (placeholder
+        # "New Audit Issue" text with an H/H/M/M/M/L pattern) — verified against the real template
+        # 2026-08-31. Those aren't blank placeholders to leave for later like the dashboard's "-"
+        # cells; they're leftover sample content and must be cleared before real rows go in, or
+        # every render would mix real observations with fake ones.
+        for row in list(list_table.rows[1:]):
+            list_table._tbl.remove(row._tr)
         for idx, obs in enumerate(listable, start=1):
             row_cells = list_table.add_row().cells
             row_cells[0].text = str(idx)
@@ -248,55 +294,108 @@ def render_report(req: RenderRequest) -> bytes:
             row_cells[2].text = obs.title or ""
             # Owner/target date deliberately left blank in draft (FR-16 / content rule)
 
-    # --- Detailed Audit Issues (generated; one block per observation) ---
-    section_heading = find_heading(doc, "Detailed Audit Issues")
-    anchor = section_heading
+    if dashboard_table:
+        # Only the Total row is genuinely computable from what this service receives — the
+        # Business Area breakdown rows require a per-observation business-area field that doesn't
+        # exist in the Observation model or the DB schema (001/002 schema review confirms this), so
+        # inventing area names or splitting counts across them would violate GR-04 (don't invent
+        # what evidence doesn't support). Those rows are left exactly as the template has them
+        # (their own "-" placeholder, for the auditor to fill in manually), and only the Total
+        # row's dashes are replaced with real counts by rating, columns matching the template's own
+        # header order: Very High / High / Medium / Low / Total.
+        rating_to_col = {
+            "active_management_very_high": 1,
+            "continuous_review_high": 2,
+            "periodic_monitoring_medium": 3,
+            "no_major_concern_low": 4,
+        }
+        counts = {col: 0 for col in rating_to_col.values()}
+        for obs in listable:
+            col = rating_to_col.get(obs.risk_rating)
+            if col is not None:
+                counts[col] += 1
+        total_row = dashboard_table.rows[-1]
+        for col in (1, 2, 3, 4):
+            total_row.cells[col].text = str(counts[col])
+        total_row.cells[5].text = str(sum(counts.values()))
+
+    # --- Detailed Audit Issues (generated; one card per observation) ---
+    # The template ships with exactly one blank "card" table per rating (verified against the real
+    # template 2026-08-31 — NOT a heading-plus-paragraphs section as previously assumed). Each card's
+    # last row holds two content cells: "Audit Issue" and "Management Action" (a third, narrow column
+    # is a decorative colour strip, merged into the Management Action cell on the 4 rated cards, and
+    # confirmed to carry no data on any card — including Area for Improvement, which has no separate
+    # "Audit Issue" label row at all). A rating with zero observations has its card removed entirely;
+    # a rating with more than one observation gets its card cloned once per extra observation, stacked
+    # in sequence_no order.
+    card_tables = find_rating_card_tables(doc)
     bookmark_counter = 1
-    for obs in req.observations:
-        label = RATING_LABELS.get(obs.risk_rating, obs.risk_rating or "")
-        colour = RATING_COLOURS.get(obs.risk_rating)
 
-        title_p = insert_paragraph_after(anchor, f"{obs.sequence_no}. {obs.title or '[untitled]'}  —  {label}")
-        add_bookmark(title_p, bookmark_counter, f"obs-{obs.id}")
-        bookmark_counter += 1
-        anchor = title_p
+    observations_by_rating = {}
+    for obs in sorted(req.observations, key=lambda o: o.sequence_no):
+        observations_by_rating.setdefault(obs.risk_rating, []).append(obs)
 
-        if obs.criteria:
-            anchor = insert_paragraph_after(anchor, f"Criteria: {obs.criteria}")
-        if obs.condition:
-            anchor = insert_paragraph_after(anchor, f"Condition: {obs.condition}")
-        # v0.2: root causes are plural, each categorised People/Process/Technology (or a combination),
-        # each with its own explanation. Verified against the real template and issued CVM report —
-        # there is no precedent there for multiple/tagged causes (that's new in v0.2), so this keeps
-        # the template's existing convention (one bold "Potential Cause" label, plain text under it)
-        # rather than inventing a new heading or table, and lists one cause per line under that label.
-        # Confirmed with Nuella 2026-08-25.
-        if obs.root_causes:
-            anchor = insert_paragraph_after(anchor, "Potential Cause", bold=True)
-            for rc in obs.root_causes:
-                if rc.flagged or not rc.explanation:
-                    anchor = insert_paragraph_after(
-                        anchor, "[FLAGGED — evidence insufficient to support this cause; auditor input required]"
-                    )
-                else:
-                    label = root_cause_category_label(rc)
-                    prefix = f"({label}) — " if label else ""
-                    anchor = insert_paragraph_after(anchor, f"{prefix}{rc.explanation}")
-        elif obs.risk_rating != "area_for_improvement":
-            anchor = insert_paragraph_after(anchor, "Potential Cause", bold=True)
-            anchor = insert_paragraph_after(anchor, "[FLAGGED — evidence insufficient to support a cause; auditor input required]")
-        if obs.risk:
-            anchor = insert_paragraph_after(anchor, f"Risk: {obs.risk}")
-        if obs.recommendation:
-            anchor = insert_paragraph_after(anchor, f"Recommendation: {obs.recommendation}")
+    for rating_key, template_table in card_tables.items():
+        obs_list = observations_by_rating.get(rating_key, [])
+        if not obs_list:
+            remove_table(template_table)
+            continue
 
-        # Management Action: never written by the agent — only rendered if the auditor already entered it.
-        anchor = insert_paragraph_after(anchor, f"Management Action: {obs.management_action or ''}")
+        # Capture the card's blank XML before any filling happens — clones must come from this
+        # pristine copy, not from a sibling card that's already been filled (which would carry its
+        # content into the "blank" clone).
+        blank_tbl_xml = copy.deepcopy(template_table._tbl)
+        prev_card = template_table
+        for i, obs in enumerate(obs_list):
+            if i == 0:
+                card = template_table
+            else:
+                new_tbl = copy.deepcopy(blank_tbl_xml)
+                prev_card._tbl.addnext(new_tbl)
+                card = Table(new_tbl, prev_card._parent)
+            prev_card = card
+            content_row = card.rows[-1]
+            issue_cell, action_cell = content_row.cells[0], content_row.cells[1]
 
-        appx = [a for a in req.appendix_items if a.observation_id == obs.id]
-        if appx:
-            refs = "; ".join(f"Appendix {a.appendix_number}: {a.content_ref}" for a in appx)
-            anchor = insert_paragraph_after(anchor, f"See: {refs}")
+            lines = [(f"{obs.sequence_no}. {obs.title or '[untitled]'}", True)]
+            if obs.criteria:
+                lines.append((f"Criteria: {obs.criteria}", False))
+            if obs.condition:
+                lines.append((f"Condition: {obs.condition}", False))
+            # v0.2: root causes are plural, each categorised People/Process/Technology (or a
+            # combination), each with its own explanation. Verified against the real template and
+            # issued CVM report — there is no precedent there for multiple/tagged causes (that's new
+            # in v0.2), so this keeps the template's existing convention (one bold "Potential Cause"
+            # label, plain text under it) rather than inventing a new heading or table, and lists one
+            # cause per line under that label. Confirmed with Nuella 2026-08-25.
+            if obs.root_causes:
+                lines.append(("Potential Cause", True))
+                for rc in obs.root_causes:
+                    if rc.flagged or not rc.explanation:
+                        lines.append(("[FLAGGED — evidence insufficient to support this cause; auditor input required]", False))
+                    else:
+                        rc_label = root_cause_category_label(rc)
+                        prefix = f"({rc_label}) — " if rc_label else ""
+                        lines.append((f"{prefix}{rc.explanation}", False))
+            elif obs.risk_rating != "area_for_improvement":
+                lines.append(("Potential Cause", True))
+                lines.append(("[FLAGGED — evidence insufficient to support a cause; auditor input required]", False))
+            if obs.risk:
+                lines.append((f"Risk: {obs.risk}", False))
+            if obs.recommendation:
+                lines.append((f"Recommendation: {obs.recommendation}", False))
+
+            appx = [a for a in req.appendix_items if a.observation_id == obs.id]
+            if appx:
+                refs = "; ".join(f"Appendix {a.appendix_number}: {a.content_ref}" for a in appx)
+                lines.append((f"See: {refs}", False))
+
+            first_para = set_cell_paragraphs(issue_cell, lines)
+            add_bookmark(first_para, bookmark_counter, f"obs-{obs.id}")
+            bookmark_counter += 1
+
+            # Management Action: never written by the agent — only rendered if the auditor already entered it.
+            action_cell.text = obs.management_action or ""
 
     buf = io.BytesIO()
     doc.save(buf)
