@@ -21,7 +21,9 @@ Design constraints carried over from the BRD / HLD:
 
 import io
 import os
+import base64
 import copy
+import logging
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -32,13 +34,76 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.table import Table
 
+logger = logging.getLogger("iard-render-service")
+
 # Beyon's fixed template is Restricted-classified (BRD Section 10) and is never committed to git
-# (see Dockerfile). It's provided to the running container instead, via a Render Secret File named
-# report_template.docx — Render mounts Secret Files at /etc/secrets/<filename>, not into the app's
-# working directory, hence this default. Override via the TEMPLATE_PATH env var for local dev
-# (point it at a plain .docx next to main.py) or if a persistent Disk is used instead of a Secret
-# File (point it at the Disk's mount path, e.g. /var/data/report_template.docx).
-TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "/etc/secrets/report_template.docx")
+# (see Dockerfile). It's provided to the running container instead of being baked into the image.
+#
+# Render's Secret Files field is a text box, and a binary .docx pasted/uploaded through it directly
+# does not survive intact — confirmed 2026-08-31: the Secret File existed at
+# /etc/secrets/report_template.docx (os.path.isfile() true) but was empty, and even a non-empty
+# direct paste risks the same silent corruption (line-ending normalization, encoding conversion,
+# truncation). Fix: the template is base64-encoded first, so what actually goes in the text box is
+# plain ASCII that survives a text field intact, and this service decodes it back to the real
+# .docx byte-for-byte at startup.
+#
+# TEMPLATE_B64_SECRET_PATH: where the base64 Secret File is mounted (default matches Render's
+#   /etc/secrets/<filename> convention for a file named report_template.b64).
+# TEMPLATE_PATH: where the decoded, real .docx is written — must be writable (/etc/secrets itself
+#   is read-only), hence /tmp by default.
+#
+# For local dev, skip the encoding: set TEMPLATE_PATH directly to a plain .docx file next to
+# main.py and leave TEMPLATE_B64_SECRET_PATH pointing at a path that doesn't exist — decoding is
+# skipped whenever TEMPLATE_PATH already resolves to a real, valid file.
+#
+# If a persistent Disk is used instead of a Secret File, skip the base64 dance entirely (Disks are
+# binary-safe) — just set TEMPLATE_PATH to the Disk's mount path.
+TEMPLATE_B64_SECRET_PATH = os.environ.get("TEMPLATE_B64_SECRET_PATH", "/etc/secrets/report_template.b64")
+TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "/tmp/report_template.docx")
+
+
+def _template_is_valid(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    try:
+        Document(path)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_template_decoded() -> None:
+    """Decode the base64 Secret File into a real .docx at TEMPLATE_PATH, if needed.
+
+    Idempotent and safe to call on every startup: does nothing if TEMPLATE_PATH already points at a
+    valid docx (local dev with a plain .docx, or a Disk-mounted template — both binary-safe, no
+    base64 involved; also covers a redeploy where the decoded file already exists from a prior
+    boot). Does nothing if the base64 Secret File isn't present either (misconfigured deploy —
+    /health's template_found/template_valid fields surface that instead of failing silently here).
+    Re-decodes if TEMPLATE_PATH exists but isn't a valid docx (e.g. a leftover empty/corrupt file
+    from before this fix), rather than treating "a file is there" as good enough.
+    """
+    if _template_is_valid(TEMPLATE_PATH):
+        return
+    if not os.path.isfile(TEMPLATE_B64_SECRET_PATH):
+        logger.warning(
+            "No valid template at TEMPLATE_PATH=%s and no base64 Secret File at "
+            "TEMPLATE_B64_SECRET_PATH=%s — /render-report will fail until one is configured.",
+            TEMPLATE_PATH, TEMPLATE_B64_SECRET_PATH,
+        )
+        return
+    try:
+        with open(TEMPLATE_B64_SECRET_PATH, "r") as f:
+            b64_text = f.read().strip()
+        docx_bytes = base64.b64decode(b64_text, validate=True)
+        os.makedirs(os.path.dirname(TEMPLATE_PATH) or ".", exist_ok=True)
+        with open(TEMPLATE_PATH, "wb") as f:
+            f.write(docx_bytes)
+        logger.info("Decoded template from %s to %s (%d bytes).", TEMPLATE_B64_SECRET_PATH, TEMPLATE_PATH, len(docx_bytes))
+    except Exception as e:
+        # Don't crash the whole service over a bad template — /health and /render-report both
+        # surface this clearly instead, and everything else the service does still works.
+        logger.error("Failed to decode base64 template from %s: %s", TEMPLATE_B64_SECRET_PATH, e)
 
 RATING_LABELS = {
     "active_management_very_high": "Active Management (Very High)",
@@ -64,6 +129,11 @@ RISK_LETTER = {
 }
 
 app = FastAPI(title="IARD Render Service")
+
+
+@app.on_event("startup")
+def on_startup():
+    ensure_template_decoded()
 
 
 class RootCause(BaseModel):
@@ -421,9 +491,31 @@ def health():
     # Surfaces the template-availability problem directly, instead of only discovering it on the
     # first real /render-report call (which is how we found it — Aug 28/31 failures both traced
     # back to this). Still 200s so this doesn't flap the service's deploy health check; the
-    # template_found field is what to check.
+    # template_valid field is what to check.
+    #
+    # os.path.isfile() alone isn't enough here — it only proves *something* exists at TEMPLATE_PATH,
+    # not that it's a real, openable .docx. python-docx raises the same "Package not found at
+    # '<path>'" error both when the file is missing AND when it exists but isn't a valid Word/zip
+    # package — e.g. corrupted by however it got uploaded (Render's Secret File field is a text
+    # paste box; a binary .docx pasted/uploaded through it can come out mangled even though a file
+    # does land at the path). A run on 2026-08-31 hit exactly this: /health reported the file
+    # present right before a /render-report call failed with that same error. So this actually
+    # tries to open it, the same way render_report() will.
+    exists = os.path.isfile(TEMPLATE_PATH)
+    valid = False
+    error = None
+    if exists:
+        try:
+            Document(TEMPLATE_PATH)
+            valid = True
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
     return {
         "status": "ok",
         "template_path": TEMPLATE_PATH,
-        "template_found": os.path.isfile(TEMPLATE_PATH),
+        "template_found": exists,
+        "template_valid": valid,
+        "template_error": error,
+        "template_b64_secret_path": TEMPLATE_B64_SECRET_PATH,
+        "template_b64_secret_found": os.path.isfile(TEMPLATE_B64_SECRET_PATH),
     }
